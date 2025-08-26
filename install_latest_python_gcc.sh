@@ -19,6 +19,11 @@ success(){ echo -e "${GREEN}✅ [SUCCESS]${RESET} $1"; }
 error()  { echo -e "${RED}❌ [ERROR]${RESET} $1" >&2; }
 fail()   { error "$1"; exit 1; }
 
+# === ROOT CHECK ===
+if [[ $EUID -ne 0 ]]; then
+ fail "This script must be run as root"
+fi
+
 # === INSTALL REQUIRED TOOLS & DEV LIBS ===
 MISSING_PKGS=()
 
@@ -89,6 +94,7 @@ set_opt_flags() {
 # === BUILD & INSTALL CPYTHON ===
 function install_prefix() {
   local PREFIX="$1"
+  local PY_VERSION="$2"
   log "Installing into $PREFIX…"
   rm -rf "$PREFIX" && mkdir -p "$PREFIX"
 
@@ -127,30 +133,58 @@ function install_prefix() {
 }
 
 # === MAIN ===
-log "Fetching latest stable CPython tag…"
-TAG=$(curl -fsSL \
-        -H "Accept: application/vnd.github.v3+json" \
-        -H "User-Agent:install-script" \
-        "https://api.github.com/repos/python/cpython/tags?per_page=100" \
-      | jq -r '.[] | select(.name|test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")) | .name' \
-      | head -n1) || error "Failed to fetch tags"
-[[ -n "$TAG" ]] || error "No stable tag found"
+main() {
+  local TAG PY_VERSION VERSIONED_DIR
 
-PY_VERSION="${TAG#v}"
-debug "Tag: $TAG → version $PY_VERSION"
+  log "Fetching latest stable CPython tag…"
+  TAG=$(curl -fsSL \
+          -H "Accept: application/vnd.github.v3+json" \
+          -H "User-Agent:install-script" \
+          "https://api.github.com/repos/python/cpython/tags?per_page=100" \
+        | jq -r '.[] | select(.name|test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")) | .name' \
+        | head -n1) || fail "Failed to fetch tags"
+  [[ -n "$TAG" ]] || fail "No stable tag found"
 
-set_opt_flags
-prepare_build "$TAG"
-install_prefix "/opt/python-${PY_VERSION}"
-install_prefix "$PYTHON_LATEST_DIR"
+  PY_VERSION="${TAG#v}"
+  debug "Tag: $TAG → version $PY_VERSION"
+  VERSIONED_DIR="/opt/python-${PY_VERSION}"
 
-log "Cleaning up…"
-rm -rf "$TMP_DIR/cpython-build" "cpython-${TAG}.tar.gz"
-debug "Removed build artifacts"
+  # Cleanup function
+  cleanup() {
+    # Only cleanup if the build directory was created
+    if [ -d "$TMP_DIR/cpython-build" ]; then
+      log "Cleaning up…"
+      rm -rf "$TMP_DIR/cpython-build" "$TMP_DIR/cpython-${TAG}.tar.gz"
+      debug "Removed build artifacts"
+    fi
+  }
+  trap cleanup EXIT INT TERM
 
-log "Done! Installed Python $PY_VERSION to:"
-echo "  • Versioned:   /opt/python-$PY_VERSION"
-echo "  • Latest link: $PYTHON_LATEST_DIR"
-echo
-echo "⚠️  Always create virtual environments from the versioned interpreter:"
-echo "    /opt/python-$PY_VERSION/bin/python3 -m venv <env>"
+  if [ -d "$VERSIONED_DIR" ]; then
+    success "Python $PY_VERSION is already installed at $VERSIONED_DIR."
+    read -p "❓ Do you want to update the '$PYTHON_LATEST_DIR' symlink to point to this version? [y/N]: " answer
+    if [[ "$answer" =~ ^[Yy] ]]; then
+      log "Updating symlink: $PYTHON_LATEST_DIR -> $VERSIONED_DIR"
+      ln -sfn "$VERSIONED_DIR" "$PYTHON_LATEST_DIR"
+      success "Symlink updated."
+    fi
+    exit 0
+  fi
+
+  set_opt_flags
+  prepare_build "$TAG"
+  install_prefix "$VERSIONED_DIR" "$PY_VERSION"
+
+  log "Creating 'latest' symlink…"
+  ln -sfn "$VERSIONED_DIR" "$PYTHON_LATEST_DIR"
+  success "Symlink created: $PYTHON_LATEST_DIR -> $VERSIONED_DIR"
+
+  log "Done! Installed Python $PY_VERSION to:"
+  echo "  • Versioned:   $VERSIONED_DIR"
+  echo "  • Latest link: $PYTHON_LATEST_DIR"
+  echo
+  echo "⚠️  Always create virtual environments from the versioned interpreter:"
+  echo "    $VERSIONED_DIR/bin/python3 -m venv <env>"
+}
+
+main "$@"
