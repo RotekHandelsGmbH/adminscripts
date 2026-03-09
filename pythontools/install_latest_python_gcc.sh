@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-
 # === CONFIGURATION ===
 PYTHON_LATEST_DIR="/opt/python-latest"
 TMP_DIR="/tmp"
@@ -19,6 +18,11 @@ warn()   { echo -e "${YELLOW}⚠️ [WARN]${RESET} $1"; }
 success(){ echo -e "${GREEN}✅ [SUCCESS]${RESET} $1"; }
 error()  { echo -e "${RED}❌ [ERROR]${RESET} $1" >&2; }
 fail()   { error "$1"; exit 1; }
+
+# === ROOT CHECK ===
+if [[ $EUID -ne 0 ]]; then
+ fail "This script must be run as root"
+fi
 
 # === INSTALL REQUIRED TOOLS & DEV LIBS ===
 MISSING_PKGS=()
@@ -66,36 +70,31 @@ function prepare_build() {
 
 # === SET OPT FLAGS ===
 set_opt_flags() {
-    echo "🔧 Set HIGH-PERFORMANCE compiler and linker flags - always check performance with pyperf - most of the time those flags degrade performance:"
+    echo "🔧 This will set HIGH-PERFORMANCE compiler and linker flags:"
     echo ""
-    echo "  CFLAGS    = -O3 -flto=auto -fno-semantic-interposition -fvisibility=hidden -march=native"
+    echo "  CFLAGS    = -O3 -march=native -flto=auto -fno-semantic-interposition"
     echo "  CXXFLAGS  = (same as CFLAGS)"
-    echo "  LDFLAGS   = -flto=auto -fno-semantic-interposition -Wl,--as-needed -Wl,-O1 -march=native"
+    echo "  LDFLAGS   = -Wl,-O1 -Wl,--as-needed -flto=auto"
     echo ""
     read -p "❓ Do you want to apply these flags for your build? You will be able to execute python only at this machines CPU (march=native) [y/N]: " answer
 
     case "$answer" in
         [yY][eE][sS]|[yY])
-            # export CFLAGS="-O3 -march=native -flto=auto -fno-semantic-interposition"
-            # export CXXFLAGS="$CFLAGS"
-            # export LDFLAGS="-Wl,-O1 -Wl,--as-needed -flto=auto"
-            export CFLAGS="-O3 -flto=auto -fno-semantic-interposition -fvisibility=hidden -march=native"
-            export CXXFLAGS="${CFLAGS}"
-            export LDFLAGS="-flto=auto -fno-semantic-interposition -Wl,--as-needed -Wl,-O1 -march=native"
-            echo "✅ Optimization flags set to: "
-            echo "🔧 CFLAGS  : ${CFLAGS}"
-            echo "🔧 LDFLAGS : ${LDFLAGS}"
+            export CFLAGS="-O3 -march=native -flto=auto -fno-semantic-interposition"
+            export CXXFLAGS="$CFLAGS"
+            export LDFLAGS="-Wl,-O1 -Wl,--as-needed -flto=auto"
+            echo "✅ Optimization flags set."
             ;;
         *)
-            echo "✅ No additional flags set"
-           ;;
+            echo "❌ Optimization flags NOT set. You can still export them manually later."
+            ;;
     esac
-    read -p "❓ Enter to continue" dummy
 }
 
 # === BUILD & INSTALL CPYTHON ===
 function install_prefix() {
   local PREFIX="$1"
+  local PY_VERSION="$2"
   log "Installing into $PREFIX…"
   rm -rf "$PREFIX" && mkdir -p "$PREFIX"
 
@@ -108,10 +107,10 @@ function install_prefix() {
 
   ./configure \
     --prefix="$PREFIX" \
+    --enable-optimizations \
     --with-lto \
     --with-openssl=/usr \
     --with-system-zlib \
-    --enable-optimizations \
     || error "Configure failed for $PREFIX"
 
   log "Building (prefix=$PREFIX)…"
@@ -134,30 +133,59 @@ function install_prefix() {
 }
 
 # === MAIN ===
-log "Fetching latest stable CPython tag…"
-TAG=$(curl -fsSL \
-        -H "Accept: application/vnd.github.v3+json" \
-        -H "User-Agent:install-script" \
-        "https://api.github.com/repos/python/cpython/tags?per_page=100" \
-      | jq -r '.[] | select(.name|test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")) | .name' \
-      | head -n1) || error "Failed to fetch tags"
-[[ -n "$TAG" ]] || error "No stable tag found"
+main() {
+  local TAG="" PY_VERSION="" VERSIONED_DIR=""
 
-PY_VERSION="${TAG#v}"
-debug "Tag: $TAG → version $PY_VERSION"
+  log "Fetching latest stable CPython tag…"
+  TAG=$(curl -fsSL \
+          -H "Accept: application/vnd.github.v3+json" \
+          -H "User-Agent:install-script" \
+          "https://api.github.com/repos/python/cpython/tags?per_page=100" \
+        | jq -r '.[] | select(.name|test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")) | .name' \
+        | head -n1) || fail "Failed to fetch tags"
+  [[ -n "$TAG" ]] || fail "No stable tag found"
 
-set_opt_flags
-prepare_build "$TAG"
-install_prefix "/opt/python-${PY_VERSION}"
-install_prefix "$PYTHON_LATEST_DIR"
+  PY_VERSION="${TAG#v}"
+  debug "Tag: $TAG → version $PY_VERSION"
+  VERSIONED_DIR="/opt/python-${PY_VERSION}"
 
-log "Cleaning up…"
-rm -rf "$TMP_DIR/cpython-build" "cpython-${TAG}.tar.gz"
-debug "Removed build artifacts"
+  # Cleanup function
+  cleanup() {
+    # Only cleanup if the build directory was created
+    if [ -d "$TMP_DIR/cpython-build" ]; then
+      log "Cleaning up…"
+      rm -rf "$TMP_DIR/cpython-build"
+      [[ -n "${TAG:-}" ]] && rm -f "$TMP_DIR/cpython-${TAG}.tar.gz"
+      debug "Removed build artifacts"
+    fi
+  }
+  trap cleanup EXIT INT TERM
 
-log "Done! Installed Python $PY_VERSION to:"
-echo "  • Versioned:   /opt/python-$PY_VERSION"
-echo "  • Latest link: $PYTHON_LATEST_DIR"
-echo
-echo "⚠️  Always create virtual environments from the versioned interpreter:"
-echo "    /opt/python-$PY_VERSION/bin/python3 -m venv <env>"
+  if [ -d "$VERSIONED_DIR" ]; then
+    success "Python $PY_VERSION is already installed at $VERSIONED_DIR."
+    read -p "❓ Do you want to update the '$PYTHON_LATEST_DIR' symlink to point to this version? [y/N]: " answer
+    if [[ "$answer" =~ ^[Yy] ]]; then
+      log "Updating symlink: $PYTHON_LATEST_DIR -> $VERSIONED_DIR"
+      ln -sfn "$VERSIONED_DIR" "$PYTHON_LATEST_DIR"
+      success "Symlink updated."
+    fi
+    exit 0
+  fi
+
+  set_opt_flags
+  prepare_build "$TAG"
+  install_prefix "$VERSIONED_DIR" "$PY_VERSION"
+
+  log "Creating 'latest' symlink…"
+  ln -sfn "$VERSIONED_DIR" "$PYTHON_LATEST_DIR"
+  success "Symlink created: $PYTHON_LATEST_DIR -> $VERSIONED_DIR"
+
+  log "Done! Installed Python $PY_VERSION to:"
+  echo "  • Versioned:   $VERSIONED_DIR"
+  echo "  • Latest link: $PYTHON_LATEST_DIR"
+  echo
+  echo "⚠️  Always create virtual environments from the versioned interpreter:"
+  echo "    $VERSIONED_DIR/bin/python3 -m venv <env>"
+}
+
+main "$@"
